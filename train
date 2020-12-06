@@ -1,0 +1,147 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import time
+
+import matplotlib
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from dataset import RGBDataset_test, RGBDataset
+from nets import Net04
+from utils import sanity_check, Logger, load_model_dic, AverageMeter, read_log, save_model
+
+torch.manual_seed(0)
+
+NUM_FRAMES = 6
+base_batch_size, base_learng_rate = 16, 1e-3
+scale_factor = 1
+num_workers = 8
+start_epoch, end_epoch = 100, 200
+ckpt_epoch = list(range(start_epoch, end_epoch, 20))
+
+dataset_root = '/scratch/e0376958/imgs'
+exp_data_root = '/home/svu/e0376958/ConvLSTM/exp_data'
+exp_data_dir = os.path.join(exp_data_root, f'{NUM_FRAMES}frames-bs{base_batch_size}-'
+                                           f'lr{base_learng_rate}-fac{scale_factor}-e{end_epoch}-rms')
+ckpt_dir = os.path.join(exp_data_dir, 'ckpt')
+log_dic = exp_data_dir
+
+checkpoint = os.path.join(ckpt_dir, 'model_303_fac1_e99')
+
+net = Net04
+
+root_dir1 = os.path.join(dataset_root, 'img1')
+root_dir2 = os.path.join(dataset_root, 'img2')
+root_dir3 = os.path.join(dataset_root, 'img3')
+
+rgb_train = RGBDataset(NUM_FRAMES, root_dir1, root_dir2, root_dir3)  # frame
+rgb_test = RGBDataset_test(NUM_FRAMES, root_dir1, root_dir2, root_dir3)
+
+dataloader_train = DataLoader(rgb_train, batch_size=int(base_batch_size * scale_factor), shuffle=False,
+                              num_workers=num_workers, pin_memory=True)
+dataloader_test = DataLoader(rgb_test, batch_size=int(base_batch_size * scale_factor),
+                             shuffle=False, num_workers=num_workers, pin_memory=True)
+
+print(f'num_gpus: {torch.cuda.device_count()}, bs: {int(base_batch_size * scale_factor)}, '
+      f'start-end epoch: {start_epoch}-{end_epoch}\n'
+      f'exp_data_dir: {exp_data_dir}')
+
+# hardware-side settings
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+
+# sanity check
+model = net()
+assert sanity_check(model, torch.randn(1, 6, 3, 112, 336), torch.randn(5, 1, 2), nn.MSELoss(),
+                    optim.SGD(model.parameters(), lr=0.005), lambda x: x < 1e-2), 'sanity not passed'
+
+# create your optimizer
+model = net()
+
+# load ckpt_epoch if available
+if checkpoint is not None:
+    model = load_model_dic(model, checkpoint)
+
+model = nn.DataParallel(model).cuda()
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.RMSprop(model.parameters(), lr=base_learng_rate * scale_factor)
+# optim.SGD(model.parameters(), lr=base_learng_rate * scale_factor)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9, last_epoch=-1)
+loss_values, test_values, epochs = [], [], []
+
+# logging
+os.makedirs(exp_data_dir, exist_ok=True)
+train_logger = Logger(os.path.join(exp_data_dir, 'train.log'),
+                      ['epoch', 'loss', 'lr'])
+val_logger = Logger(os.path.join(exp_data_dir, 'val.log'),
+                    ['epoch', 'loss'])
+train_meter = AverageMeter()
+test_meter = AverageMeter()
+
+for epoch in range(start_epoch, end_epoch):  # loop over the dataset multiple times
+    running_loss = AverageMeter()
+    running_test_loss = AverageMeter()
+    start_time = time.time()
+
+    if scheduler is not None:
+        scheduler.step(epoch)
+
+    for i, data in enumerate(dataloader_train, 0):
+        # get the inputs; data is a list of [inputs, labels]
+        X_t, y_t = data['X_train'].cuda(), data['y_train'].cuda()
+        optimizer.zero_grad()
+        for j in range(len(X_t)):
+            outputs = model(X_t[j].reshape(1, NUM_FRAMES, 3, 112, 336))
+            if j == 0:
+                loss = criterion(outputs, y_t[j].reshape(-1, 1, 2))
+            else:
+                loss += criterion(outputs, y_t[j].reshape(-1, 1, 2))
+        loss.backward()
+        optimizer.step()
+        running_loss.update(loss.item())
+    loss_values.append(running_loss.avg)
+
+    with torch.no_grad():
+        for i, data in enumerate(dataloader_test, 0):
+            X_test, y_test = data['X_test'].cuda(), data['y_test'].cuda()
+            for j in range(len(X_test)):
+                out_test = model(X_test[j].reshape(1, NUM_FRAMES, 3, 112, 336))
+                if j == 0:
+                    test_loss = criterion(out_test, y_test[j].reshape(-1, 1, 2))
+                else:
+                    test_loss += criterion(out_test, y_test[j].reshape(-1, 1, 2))
+            running_test_loss.update(test_loss.item())
+        test_values.append(running_test_loss.avg)
+    epochs.append(epoch)
+
+    train_logger.log({'epoch': epoch, 'loss': running_loss.avg, 'lr': optimizer.param_groups[0]['lr']})
+    val_logger.log({'epoch': epoch, 'loss': running_test_loss.avg})
+
+    end_time = time.time()
+    if epoch % 10 == 9:
+        save_model(ckpt_dir, f'model_303_fac{scale_factor}_e{epoch}', model)
+
+    print('[epoch%d] running_loss: %.3f, test_loss:%.3f, runtime = %.3f' % (
+        epoch + 1, running_loss.avg, running_test_loss.avg, (end_time - start_time) / 60))
+
+print('Finished Training')
+
+save_model(ckpt_dir, f'final_model_303_fac{scale_factor}', model)
+
+# plot curve
+if epoch == end_epoch - 1:
+    matplotlib.use('Agg')  # use noninteractive backend
+    plt.title('Loss vs Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    epochs, loss_values, lr = read_log(os.path.join(exp_data_dir, 'train.log'))
+    epochs, test_values = read_log(os.path.join(exp_data_dir, 'val.log'))
+    plt.plot(epochs, loss_values, label='train loss', color='C0')
+    plt.plot(epochs, test_values, label='test loss', color='C2')
+    plt.savefig(os.path.join(ckpt_dir, f'curve.jpg'))
